@@ -9,6 +9,7 @@ import select
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -147,6 +148,71 @@ class RoutingTests(unittest.TestCase):
     def test_same_process_agent_needs_no_session_file(self):
         (self.registry / f"{self.stem}.json").write_text(json.dumps({"tty": self.tty, "pid": os.getpid()}))
         self.assertIn(b"state=working", self.fire("pre_llm_call", session_id="anything"))
+
+
+@unittest.skipUnless(Path("/proc/self/environ").exists(), "needs Linux /proc")
+class TuiRoutingTests(unittest.TestCase):
+    """`hermes --tui` registers nothing: the agent half finds its Ink process through /proc."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        base = Path(self.tmp.name)
+        self.active = base / "active-session.json"
+        env = {
+            "HERMES_PROGRAM_STATUS_REGISTRY": str(base / "registry"),
+            "HERMES_PROGRAM_STATUS_HOMES": str(base / "home"),
+            "HERMES_PROGRAM_STATUS_APP": "hermes",
+        }
+        self.env = mock.patch.dict(os.environ, env)
+        self.env.start()
+        self.mod = load_plugin(env)
+        self.master, self.slave = os.openpty()
+        self.procs: list[subprocess.Popen] = []
+
+    def tearDown(self):
+        for proc in self.procs:
+            proc.kill()
+            proc.wait()
+        self.env.stop()
+        os.close(self.master)
+        os.close(self.slave)
+        self.tmp.cleanup()
+
+    def tui(self, session_id: str, **extra_env: str):
+        """A stand-in for the Ink front end: stdout on our pty, the TUI's env, idle."""
+        self.active.write_text(json.dumps({"session_id": session_id}))
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("HC_", "HERDR_", "HERMES_TUI_"))}
+        env.update({"HC_TERMINAL_ID": "t1", "HERMES_TUI_ACTIVE_SESSION_FILE": str(self.active), **extra_env})
+        self.procs.append(subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                                           stdout=self.slave, env=env))
+        time.sleep(0.2)
+
+    def fire(self, hook: str, **kwargs):
+        self.mod.HOOKS[hook](**kwargs)
+        return read_all(self.master)
+
+    def test_turn_reaches_the_tui_terminal(self):
+        self.tui("s1")
+        self.assertIn(b"state=working:app=hermes", self.fire("pre_llm_call", session_id="s1"))
+        self.assertIn(b"state=done", self.fire("post_llm_call", session_id="s1"))
+
+    def test_other_session_is_ignored(self):
+        self.tui("s1")
+        self.assertEqual(self.fire("pre_llm_call", session_id="s2"), b"")
+
+    def test_herdr_tui_pane_is_ignored(self):
+        self.tui("s1", HERDR_PANE_ID="w1:p1")
+        self.assertEqual(self.fire("pre_llm_call", session_id="s1"), b"")
+
+    def test_plain_terminal_is_ignored(self):
+        self.tui("s1", HC_TERMINAL_ID="")
+        self.assertEqual(self.fire("pre_llm_call", session_id="s1"), b"")
+
+    def test_session_open_reports_idle_once_the_tui_names_the_session(self):
+        self.tui("not-yet")
+        self.fire("on_session_open", session_id="s1")  # the TUI writes its session file after the open
+        self.active.write_text(json.dumps({"session_id": "s1"}))
+        self.assertIn(b"state=idle", read_all(self.master, timeout=2.0))
 
 
 class FrontEndTests(unittest.TestCase):

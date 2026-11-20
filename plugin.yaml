@@ -1,12 +1,13 @@
 name: hermes-program-status
 version: "0.1.0"
-description: "Report a classic Hermes CLI session's live status (idle, working, blocked, done, error) to its terminal with OSC 7501, the Program Status Protocol, so herdr-core (the Herdr desktop and phone apps) lists Hermes as an agent. Works when turns run in the Hermes gateway. Uses documented hooks only and patches nothing."
+description: "Report a Hermes CLI or TUI session's live status (idle, working, blocked, done, error) to its terminal with OSC 7501, the Program Status Protocol, so herdr-core (the Herdr desktop and phone apps) lists Hermes as an agent. Works when turns run in the Hermes gateway. Uses documented hooks only and patches nothing."
 author: "Si Cruse Consulting Ltd"
 license: MIT
 homepage: https://github.com/sicruse/hermes-program-status
 requires_hermes: ">=0.23.1"
 tags: [terminal, status, osc7501, herdr]
 provides_hooks:
+  - on_session_open
   - pre_llm_call
   - post_llm_call
   - on_session_end
