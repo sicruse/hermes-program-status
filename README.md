@@ -1,6 +1,6 @@
 # hermes-program-status
 
-A [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin that reports the live status of a classic `hermes` CLI session to its terminal with OSC 7501, the [Program Status Protocol](https://mitchellh.com/writing/program-status-osc7501).
+A [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin that reports the live status of a `hermes` CLI or `hermes --tui` session to its terminal with OSC 7501, the [Program Status Protocol](https://mitchellh.com/writing/program-status-osc7501).
 
 The first terminal that uses those reports is herdr-core, the engine under the [Herdr](https://herdr.dev) desktop app and the Herdr phone app. With this plugin, a Hermes session in a Herdr terminal shows up as an agent with a status (idle, working, needs you, done) on the desktop and on the phone, the same way Claude Code and Codex do. Without it, Herdr shows Hermes as a plain shell.
 
@@ -29,7 +29,7 @@ Approvals decided by Hermes's "smart" approval model do not count as blocked, be
 
 ## Requirements
 
-- Hermes Agent 0.23.1 or newer, using the classic CLI (`hermes`). The Ink interface (`hermes --tui`) is not covered.
+- Hermes Agent 0.23.1 or newer, using the classic CLI (`hermes`) or the Ink interface (`hermes --tui`). The Ink interface is covered on Linux only, because the plugin finds it through `/proc`.
 - macOS or Linux. Windows is not supported.
 - A terminal that consumes OSC 7501. By default the plugin reports only inside herdr-core terminals (those started by the Herdr desktop app or `hc`). See Settings to report in other terminals.
 
@@ -102,6 +102,8 @@ The plugin has two halves in one file.
 - Front end. When the plugin loads in the CLI process, which owns the terminal, it checks that the terminal consumes OSC 7501. If so, it writes a small registry file naming its tty and process id, and reports `idle`. The file is removed when the CLI exits.
 - Agent half. The status hooks (`pre_llm_call`, `post_llm_call`, `pre_approval_request`, `post_approval_response`, `on_human_input_request`, `on_human_input_resolved`, `on_session_end`) usually fire in the gateway. For each event the plugin takes the event's session id and finds the terminal showing that session. Hermes already records this in a per-terminal file, `<HERMES_HOME>/terminal-sessions/tty-<device>`, which the CLI keeps current for `hermes --continue`. The plugin matches that file against the registry and writes one OSC 7501 sequence to the tty device.
 
+- Ink interface (`hermes --tui`). The TUI runs no plugin code and writes no terminal-session file, but its process carries `HC_TERMINAL_ID` and `HERMES_TUI_ACTIVE_SESSION_FILE`, a small file naming the session it shows. The agent half looks for a same-user process with both (Linux `/proc`), matches the session id, and writes to that process's tty. `on_session_open` reports `idle` as soon as the TUI names its new session.
+
 When the agent runs in the same process as the terminal (no gateway), the plugin writes to its own registered tty directly.
 
 Sessions from messaging platforms, cron jobs and unregistered terminals never match, so the plugin does nothing for them.
@@ -109,6 +111,7 @@ Sessions from messaging platforms, cron jobs and unregistered terminals never ma
 ## What it reads and writes
 
 - Reads `<HERMES_HOME>/terminal-sessions/tty-*` for the default home and each profile home.
+- On Linux, reads `/proc/<pid>/environ` and the `/proc/<pid>/fd/1` link of the same user's processes to find `hermes --tui` front ends, and the active-session file their environment names.
 - Writes one small JSON file per live CLI session to `<Hermes root>/plugin-data/hermes-program-status/` (normally `~/.hermes/plugin-data/hermes-program-status/`, shared across profiles), and removes it on exit.
 - Writes OSC 7501 sequences, about 30 bytes each, to tty devices that a live Hermes CLI of the same user registered.
 - No network access, no subprocesses, no credentials, no telemetry. Failures are silent and never affect the agent.
@@ -130,6 +133,7 @@ All optional, read from the environment of the Hermes process.
 - `done` stays until your next prompt, because Hermes has no hook for "the user came back".
 - Right after a session changes (`/new`, `/resume`, or compression starting a new session id) there can be a short gap before the CLI rewrites its terminal-session file. Reports resume after that.
 - The plugin depends on the `terminal-sessions` file name and content, which Hermes uses internally for `hermes --continue`. If a Hermes update changes that format, status stops until the plugin is updated. It fails quietly, not loudly.
+- TUI support depends on `HERMES_TUI_ACTIVE_SESSION_FILE`, which the Hermes TUI launcher sets internally. If a Hermes update drops it, TUI status stops quietly; classic CLI status is unaffected.
 - If `session.terminal_continue` is turned off in Hermes's config, there are no terminal-session files and the agent half cannot find the terminal when turns run in the gateway.
 
 ## Uninstall

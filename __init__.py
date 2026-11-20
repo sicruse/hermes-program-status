@@ -34,6 +34,7 @@ import atexit
 import json
 import os
 import re
+import threading
 import time
 from pathlib import Path
 
@@ -143,6 +144,41 @@ def _session_in_crumb(home: Path, stem: str, session_id: str) -> bool:
     return isinstance(crumb, dict) and crumb.get("session_id") == session_id
 
 
+def _tui_tty_for(session_id: str) -> str | None:
+    """The tty of a live ``hermes --tui`` front end showing ``session_id``, or None.
+
+    The Ink TUI runs no plugin code and writes no terminal-sessions file, but its
+    process carries ``HERMES_TUI_ACTIVE_SESSION_FILE`` (the session it shows) and
+    the pane's ``HC_TERMINAL_ID``. Same-user processes only; Linux /proc only.
+    """
+    proc_root = Path("/proc")
+    if not proc_root.is_dir():
+        return None
+    uid = os.getuid()
+    for proc in proc_root.iterdir():
+        if not proc.name.isdigit():
+            continue
+        try:
+            if proc.stat().st_uid != uid:
+                continue
+            raw = (proc / "environ").read_bytes()
+        except OSError:
+            continue
+        if b"HERMES_TUI_ACTIVE_SESSION_FILE=" not in raw:
+            continue
+        env = dict(os.fsdecode(item).split("=", 1) for item in raw.split(b"\0") if b"=" in item)
+        if not _consumes_osc7501(env):
+            continue
+        try:
+            active = json.loads(Path(env["HERMES_TUI_ACTIVE_SESSION_FILE"]).read_text())
+            tty = os.readlink(proc / "fd" / "1")
+        except (OSError, ValueError):
+            continue
+        if isinstance(active, dict) and active.get("session_id") == session_id and tty.startswith(("/dev/pts/", "/dev/tty")):
+            return tty
+    return None
+
+
 def _tty_for(session_id: str) -> str | None:
     """The registered tty showing ``session_id``, or None."""
     hit = _cache.get(session_id)
@@ -164,6 +200,7 @@ def _tty_for(session_id: str) -> str | None:
             if any(_session_in_crumb(home, reg.stem, session_id) for home in _homes()):
                 tty = entry.get("tty")
                 break
+        tty = tty or _tui_tty_for(session_id)
     except Exception:
         tty = None
     _cache[session_id] = (tty, time.monotonic() + (_HIT_TTL if tty else _MISS_TTL))
@@ -194,7 +231,27 @@ def _on_session_end(**kwargs) -> None:
         _emit("on_session_end", "idle", kwargs)
 
 
+def _on_session_open(**kwargs) -> None:
+    """Report idle when a TUI opens a session (a classic CLI front end already did at load)."""
+    session_id = kwargs.get("session_id")
+    if not isinstance(session_id, str) or not session_id:
+        return
+
+    def report() -> None:
+        # The TUI writes its active-session file only after the open returns: poll briefly.
+        for _ in range(10):
+            tty = _tui_tty_for(session_id)
+            if tty:
+                _write_tty(tty, "idle")
+                _trace(role="agent", hook="on_session_open", state="idle", tty=tty)
+                return
+            time.sleep(0.5)
+
+    threading.Thread(target=report, name=f"{PLUGIN_NAME}-open", daemon=True).start()
+
+
 HOOKS = {
+    "on_session_open": _on_session_open,
     "pre_llm_call": lambda **kw: _emit("pre_llm_call", "working", kw),
     "post_llm_call": lambda **kw: _emit("post_llm_call", "done", kw),
     "on_session_end": _on_session_end,
@@ -205,15 +262,16 @@ HOOKS = {
 }
 
 
-def _consumes_osc7501() -> bool:
-    """True when this process's terminal is one we should report to."""
-    if os.environ.get("HERDR_PANE_ID"):
+def _consumes_osc7501(env=None) -> bool:
+    """True when the terminal of the process with ``env`` (default: this one) is one we should report to."""
+    env = os.environ if env is None else env
+    if env.get("HERDR_PANE_ID"):
         # A Herdr TUI pane. Herdr TUI detects Hermes on its own; stay out of its way,
         # even if the TUI server itself was started inside a herdr-core terminal.
         return False
     if TERMINALS == "any":
         return True
-    return bool(os.environ.get("HC_TERMINAL_ID"))
+    return bool(env.get("HC_TERMINAL_ID"))
 
 
 def _attach_frontend() -> None:
