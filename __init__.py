@@ -34,6 +34,7 @@ import atexit
 import json
 import os
 import re
+import threading
 import time
 from pathlib import Path
 
@@ -188,15 +189,99 @@ def _on_approval_request(**kwargs) -> None:
 
 
 def _on_session_end(**kwargs) -> None:
+    _turn_ended(kwargs.get("session_id"))
     if kwargs.get("failed"):
         _emit("on_session_end", "error", kwargs)
     elif kwargs.get("interrupted"):
         _emit("on_session_end", "idle", kwargs)
 
 
+# Background subagents. Top-level delegate_task runs children in the background: the parent's
+# turn ends while they work, and their results re-enter later as a new parent turn. The session
+# stays "working" until then, as Claude Code does with background agents. All of these hooks
+# fire in the process that runs the parent agent; subagent_stop fires on a worker thread.
+_SETTLE = 5.0  # seconds to wait for the results turn after the last child stops
+_lock = threading.Lock()
+_children: dict[str, set] = {}  # parent session id -> running child session ids
+_turns: set = set()  # session ids with a turn in flight
+_timers: dict[str, threading.Timer] = {}  # parent session id -> pending "done" fallback
+
+
+def _cancel_settle(session_id) -> None:
+    timer = _timers.pop(session_id, None)
+    if timer:
+        timer.cancel()
+
+
+def _turn_started(session_id) -> None:
+    with _lock:
+        _turns.add(session_id)
+        _cancel_settle(session_id)
+
+
+def _turn_ended(session_id) -> None:
+    with _lock:
+        _turns.discard(session_id)
+
+
+def _on_pre_llm_call(**kwargs) -> None:
+    _turn_started(kwargs.get("session_id"))
+    _emit("pre_llm_call", "working", kwargs)
+
+
+def _on_post_llm_call(**kwargs) -> None:
+    session_id = kwargs.get("session_id")
+    _turn_ended(session_id)
+    with _lock:
+        waiting = bool(_children.get(session_id))
+    _emit("post_llm_call", "working" if waiting else "done", kwargs)
+
+
+def _on_subagent_start(**kwargs) -> None:
+    parent, child = kwargs.get("parent_session_id"), kwargs.get("child_session_id")
+    if not parent or not child:
+        return
+    with _lock:
+        _children.setdefault(parent, set()).add(child)
+        _cancel_settle(parent)
+    _emit("subagent_start", "working", {"session_id": parent})
+
+
+def _settled(parent: str) -> None:
+    """No results turn followed the last child (e.g. /stop): stop showing the session as working."""
+    with _lock:
+        _timers.pop(parent, None)
+        if _children.get(parent) or parent in _turns:
+            return
+    _emit("subagent_settle", "done", {"session_id": parent})
+
+
+def _on_subagent_stop(**kwargs) -> None:
+    parent = kwargs.get("parent_session_id")
+    with _lock:
+        running = _children.get(parent)
+        if running is None:
+            return
+        running.discard(kwargs.get("child_session_id"))
+        if running:
+            return
+        del _children[parent]
+        if parent in _turns:
+            return  # the parent's own turn reports its end
+        # The results turn normally starts right away and reports "working" itself; reporting
+        # "done" first would flash a finished notification in Herdr.
+        _cancel_settle(parent)
+        timer = threading.Timer(_SETTLE, _settled, args=(parent,))
+        timer.daemon = True
+        _timers[parent] = timer
+        timer.start()
+
+
 HOOKS = {
-    "pre_llm_call": lambda **kw: _emit("pre_llm_call", "working", kw),
-    "post_llm_call": lambda **kw: _emit("post_llm_call", "done", kw),
+    "pre_llm_call": _on_pre_llm_call,
+    "post_llm_call": _on_post_llm_call,
+    "subagent_start": _on_subagent_start,
+    "subagent_stop": _on_subagent_stop,
     "on_session_end": _on_session_end,
     "pre_approval_request": _on_approval_request,
     "post_approval_response": lambda **kw: _emit("post_approval_response", "working", kw),

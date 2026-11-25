@@ -9,6 +9,7 @@ import select
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -115,6 +116,46 @@ class RoutingTests(unittest.TestCase):
         self.crumb("s1")
         self.assertIn(b"state=working", self.fire("pre_llm_call", session_id="s1"))
         self.assertIn(b"state=done", self.fire("post_llm_call", session_id="s1"))
+
+    def test_background_subagents_keep_the_session_working(self):
+        self.crumb("s1")
+        self.fire("pre_llm_call", session_id="s1")
+        self.assertIn(b"state=working", self.fire("subagent_start", parent_session_id="s1", child_session_id="c1"))
+        self.fire("subagent_start", parent_session_id="s1", child_session_id="c2")
+        # The parent ends its turn while the children run.
+        ended = self.fire("post_llm_call", session_id="s1")
+        self.assertIn(b"state=working", ended)
+        self.assertNotIn(b"state=done", ended)
+        self.assertEqual(self.fire("subagent_stop", parent_session_id="s1", child_session_id="c1"), b"")
+        self.assertEqual(self.fire("subagent_stop", parent_session_id="s1", child_session_id="c2"), b"")
+        # Their results re-enter as a new parent turn.
+        self.assertIn(b"state=working", self.fire("pre_llm_call", session_id="s1"))
+        self.assertIn(b"state=done", self.fire("post_llm_call", session_id="s1"))
+
+    # fire() reads for 0.2 s, so the fallback delay must be longer for its report to land later.
+    def test_results_turn_cancels_the_fallback(self):
+        self.crumb("s1")
+        self.mod._SETTLE = 0.5
+        self.fire("subagent_start", parent_session_id="s1", child_session_id="c1")
+        self.fire("post_llm_call", session_id="s1")
+        self.assertEqual(self.fire("subagent_stop", parent_session_id="s1", child_session_id="c1"), b"")
+        self.assertIn(b"state=working", self.fire("pre_llm_call", session_id="s1"))
+        time.sleep(0.6)
+        self.assertEqual(read_all(self.master), b"")
+
+    def test_session_is_done_when_no_results_turn_follows(self):
+        self.crumb("s1")
+        self.mod._SETTLE = 0.5
+        self.fire("subagent_start", parent_session_id="s1", child_session_id="c1")
+        self.fire("post_llm_call", session_id="s1")
+        self.assertEqual(self.fire("subagent_stop", parent_session_id="s1", child_session_id="c1"), b"")
+        time.sleep(0.6)
+        self.assertIn(b"state=done", read_all(self.master))
+
+    def test_nested_subagents_are_ignored(self):
+        self.crumb("s1")
+        self.assertEqual(self.fire("subagent_start", parent_session_id="c1", child_session_id="c1a"), b"")
+        self.assertEqual(self.fire("subagent_stop", parent_session_id="c1", child_session_id="c1a"), b"")
 
     def test_question_blocks_then_resumes(self):
         self.crumb("s1")

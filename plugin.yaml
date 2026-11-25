@@ -14,3 +14,5 @@ provides_hooks:
   - post_approval_response
   - on_human_input_request
   - on_human_input_resolved
+  - subagent_start
+  - subagent_stop

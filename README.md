@@ -21,6 +21,7 @@ This plugin bridges that gap without patching Hermes. It uses only documented pl
 | Hermes asks you a question, or waits for an approval from you | `blocked` |
 | You answer or decide | `working` |
 | The turn finishes | `done` |
+| The turn finishes while background subagents still run | `working`, until the turn that receives their results finishes |
 | The run fails | `error` |
 | You interrupt the run | `idle` |
 | Hermes exits | cleared by the terminal when the shell returns |
